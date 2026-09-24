@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Video Downloader API")
 
-# Allow requests from your GitHub Pages website
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,6 +30,12 @@ app.add_middleware(
 class VideoRequest(BaseModel):
     url: HttpUrl
 
+# Common browser headers to bypass cloud IP blocks
+COMMON_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
+
 @app.get("/api/health")
 def health_check():
     return {"status": "ok"}
@@ -38,17 +43,26 @@ def health_check():
 @app.post("/api/fetch-info")
 def fetch_video_info(req: VideoRequest):
     url_str = str(req.url)
+
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
+        "http_headers": COMMON_HEADERS,
+        # Android client bypasses YouTube bot protection on cloud hosts
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"]
+            }
+        }
     }
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url_str, download=False)
     except Exception as e:
         logger.error(f"Extraction failed: {str(e)}")
-        raise HTTPException(status_code=400, detail="Invalid link or the video is private.")
+        raise HTTPException(status_code=400, detail="Invalid link, or the platform blocked access. Ensure the link is public.")
 
     formats_list = []
     seen_heights = set()
@@ -72,6 +86,7 @@ def fetch_video_info(req: VideoRequest):
         if vcodec != "none" and height and height >= 144:
             if height not in seen_heights:
                 seen_heights.add(height)
+
                 if height >= 2160: quality_text = f"{height}p (4K Ultra HD)"
                 elif height >= 1440: quality_text = f"{height}p (2K Quad HD)"
                 elif height >= 1080: quality_text = f"{height}p (Full HD 1080p)"
@@ -127,6 +142,12 @@ def download_media(video_url: str = Query(...), format_id: str = Query(...), tit
         "quiet": True,
         "no_warnings": True,
         "merge_output_format": ext if type != "audio" else None,
+        "http_headers": COMMON_HEADERS,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"]
+            }
+        }
     }
 
     try:
