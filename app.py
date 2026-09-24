@@ -30,11 +30,37 @@ app.add_middleware(
 class VideoRequest(BaseModel):
     url: HttpUrl
 
-# Common browser headers to bypass cloud IP blocks
+# Universal headers mimicking real devices
 COMMON_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'User-Agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 14; US) gzip',
     'Accept-Language': 'en-US,en;q=0.9',
 }
+
+def get_ydl_options(download=False, outtmpl=None, format_selector=None, ext=None):
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "nocheckcertificate": True,
+        "geo_bypass": True,
+        # iOS, Android and TV clients bypass cloud server IP blocks without requiring login
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["ios", "android", "web_creator"],
+                "player_skip": ["webpage", "configs"]
+            }
+        },
+        "http_headers": COMMON_HEADERS,
+    }
+    
+    if not download:
+        opts["skip_download"] = True
+    else:
+        opts["format"] = format_selector
+        opts["outtmpl"] = outtmpl
+        if ext and ext != "mp3":
+            opts["merge_output_format"] = ext
+            
+    return opts
 
 @app.get("/api/health")
 def health_check():
@@ -43,30 +69,36 @@ def health_check():
 @app.post("/api/fetch-info")
 def fetch_video_info(req: VideoRequest):
     url_str = str(req.url)
-
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "http_headers": COMMON_HEADERS,
-        # Android client bypasses YouTube bot protection on cloud hosts
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web"]
-            }
-        }
-    }
+    ydl_opts = get_ydl_options(download=False)
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url_str, download=False)
     except Exception as e:
-        logger.error(f"Extraction failed: {str(e)}")
-        raise HTTPException(status_code=400, detail="Invalid link, or the platform blocked access. Ensure the link is public.")
+        logger.error(f"First attempt failed: {str(e)}")
+        # Fallback with mweb client if primary clients fail
+        try:
+            fallback_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "nocheckcertificate": True,
+                "skip_download": True,
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["mweb"]
+                    }
+                }
+            }
+            with yt_dlp.YoutubeDL(fallback_opts) as ydl_fb:
+                info = ydl_fb.extract_info(url_str, download=False)
+        except Exception as err:
+            logger.error(f"Fallback extraction failed: {str(err)}")
+            raise HTTPException(status_code=400, detail="YouTube is currently restricting cloud server IPs for this video. Try another link or check again shortly.")
 
     formats_list = []
     seen_heights = set()
 
+    # Generic or Direct stream format
     if info.get("url") and not info.get("formats"):
         formats_list.append({
             "format_id": "best",
@@ -104,6 +136,7 @@ def fetch_video_info(req: VideoRequest):
                     "has_sound": True
                 })
 
+    # Pure Audio option
     formats_list.append({
         "format_id": "bestaudio",
         "type": "audio",
@@ -136,19 +169,12 @@ def download_media(video_url: str = Query(...), format_id: str = Query(...), tit
     else:
         format_selector = f"{format_id}+bestaudio/bestvideo+bestaudio/best"
 
-    ydl_opts = {
-        "format": format_selector,
-        "outtmpl": temp_filepath,
-        "quiet": True,
-        "no_warnings": True,
-        "merge_output_format": ext if type != "audio" else None,
-        "http_headers": COMMON_HEADERS,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web"]
-            }
-        }
-    }
+    ydl_opts = get_ydl_options(
+        download=True,
+        outtmpl=temp_filepath,
+        format_selector=format_selector,
+        ext=ext
+    )
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
