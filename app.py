@@ -30,37 +30,24 @@ app.add_middleware(
 class VideoRequest(BaseModel):
     url: HttpUrl
 
-# Universal headers mimicking real devices
 COMMON_HEADERS = {
-    'User-Agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 14; US) gzip',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Accept-Language': 'en-US,en;q=0.9',
 }
 
-def get_ydl_options(download=False, outtmpl=None, format_selector=None, ext=None):
-    opts = {
+def get_opts():
+    return {
         "quiet": True,
         "no_warnings": True,
         "nocheckcertificate": True,
         "geo_bypass": True,
-        # iOS, Android and TV clients bypass cloud server IP blocks without requiring login
+        "http_headers": COMMON_HEADERS,
         "extractor_args": {
             "youtube": {
-                "player_client": ["ios", "android", "web_creator"],
-                "player_skip": ["webpage", "configs"]
+                "player_client": ["tvhtml5_simply_embedded", "web_embedded", "android"]
             }
-        },
-        "http_headers": COMMON_HEADERS,
+        }
     }
-    
-    if not download:
-        opts["skip_download"] = True
-    else:
-        opts["format"] = format_selector
-        opts["outtmpl"] = outtmpl
-        if ext and ext != "mp3":
-            opts["merge_output_format"] = ext
-            
-    return opts
 
 @app.get("/api/health")
 def health_check():
@@ -69,87 +56,62 @@ def health_check():
 @app.post("/api/fetch-info")
 def fetch_video_info(req: VideoRequest):
     url_str = str(req.url)
-    ydl_opts = get_ydl_options(download=False)
+    ydl_opts = get_opts()
+    ydl_opts["skip_download"] = True
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url_str, download=False)
     except Exception as e:
-        logger.error(f"First attempt failed: {str(e)}")
-        # Fallback with mweb client if primary clients fail
-        try:
-            fallback_opts = {
-                "quiet": True,
-                "no_warnings": True,
-                "nocheckcertificate": True,
-                "skip_download": True,
-                "extractor_args": {
-                    "youtube": {
-                        "player_client": ["mweb"]
-                    }
-                }
-            }
-            with yt_dlp.YoutubeDL(fallback_opts) as ydl_fb:
-                info = ydl_fb.extract_info(url_str, download=False)
-        except Exception as err:
-            logger.error(f"Fallback extraction failed: {str(err)}")
-            raise HTTPException(status_code=400, detail="YouTube is currently restricting cloud server IPs for this video. Try another link or check again shortly.")
+        logger.error(f"Extraction error: {str(e)}")
+        raise HTTPException(status_code=400, detail="Cannot access media. The link may be private or restricted.")
 
     formats_list = []
-    seen_heights = set()
-
-    # Generic or Direct stream format
-    if info.get("url") and not info.get("formats"):
-        formats_list.append({
-            "format_id": "best",
-            "type": "video",
-            "quality": "HD Standard",
-            "label": "Full Video (MP4 + Audio)",
-            "has_sound": True
-        })
+    seen = set()
 
     raw_formats = info.get("formats", [])
     raw_formats.sort(key=lambda x: (x.get("height") or 0), reverse=True)
 
     for f in raw_formats:
-        height = f.get("height")
+        h = f.get("height")
         vcodec = f.get("vcodec", "none")
-
-        if vcodec != "none" and height and height >= 144:
-            if height not in seen_heights:
-                seen_heights.add(height)
-
-                if height >= 2160: quality_text = f"{height}p (4K Ultra HD)"
-                elif height >= 1440: quality_text = f"{height}p (2K Quad HD)"
-                elif height >= 1080: quality_text = f"{height}p (Full HD 1080p)"
-                elif height >= 720: quality_text = f"{height}p (HD 720p)"
-                elif height >= 480: quality_text = f"{height}p (SD 480p)"
-                elif height >= 360: quality_text = f"{height}p (Medium 360p)"
-                else: quality_text = f"{height}p (Low {height}p)"
-
+        if vcodec != "none" and h and h >= 360:
+            if h not in seen:
+                seen.add(h)
                 formats_list.append({
                     "format_id": str(f.get("format_id")),
-                    "height": height,
+                    "height": h,
                     "type": "video",
-                    "quality": quality_text,
-                    "label": f"{quality_text} • Audio Included 🔊",
-                    "has_sound": True
+                    "quality": f"{h}p",
+                    "label": f"{h}p HD Video (MP4) 🔊",
+                    "filesize": f.get("filesize") or f.get("filesize_approx") or 0
                 })
 
-    # Pure Audio option
+    # Always ensure 720p or Best exists
+    if not formats_list:
+        formats_list.append({
+            "format_id": "best",
+            "height": 720,
+            "type": "video",
+            "quality": "720p",
+            "label": "HD Quality (MP4) 🔊",
+            "filesize": 0
+        })
+
+    # Audio track
     formats_list.append({
         "format_id": "bestaudio",
         "type": "audio",
-        "quality": "Audio Only",
-        "label": "Audio Only (MP3 ~320kbps 🎵)",
-        "has_sound": True
+        "quality": "Audio",
+        "label": "High Quality Audio (MP3 🎵)",
+        "filesize": 0
     })
 
     return {
-        "title": info.get("title", "downloaded_video"),
+        "title": info.get("title", "video"),
         "thumbnail": info.get("thumbnail"),
-        "duration": info.get("duration", 0),
-        "uploader": info.get("uploader", "Unknown"),
+        "duration": info.get("duration", 180),
+        "uploader": info.get("uploader", "Social Media"),
         "formats": formats_list,
         "original_url": url_str
     }
@@ -160,27 +122,26 @@ def download_media(video_url: str = Query(...), format_id: str = Query(...), tit
     ext = "mp3" if type == "audio" else "mp4"
 
     temp_dir = tempfile.mkdtemp()
-    temp_filepath = os.path.join(temp_dir, f"%(title)s.%(ext)s")
+    temp_filepath = os.path.join(temp_dir, "%(title)s.%(ext)s")
 
     if type == "audio":
         format_selector = "bestaudio/best"
     elif format_id == "best":
-        format_selector = "best"
+        format_selector = "bestvideo+bestaudio/best"
     else:
         format_selector = f"{format_id}+bestaudio/bestvideo+bestaudio/best"
 
-    ydl_opts = get_ydl_options(
-        download=True,
-        outtmpl=temp_filepath,
-        format_selector=format_selector,
-        ext=ext
-    )
+    ydl_opts = get_opts()
+    ydl_opts.update({
+        "format": format_selector,
+        "outtmpl": temp_filepath,
+        "merge_output_format": ext if type != "audio" else None,
+    })
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             download_info = ydl.extract_info(video_url, download=True)
             real_filepath = ydl.prepare_filename(download_info)
-            
             base, _ = os.path.splitext(real_filepath)
             if os.path.exists(f"{base}.{ext}"):
                 real_filepath = f"{base}.{ext}"
@@ -191,10 +152,10 @@ def download_media(video_url: str = Query(...), format_id: str = Query(...), tit
                 else:
                     raise Exception("File not found on server.")
     except Exception as e:
-        logger.error(f"Download processing error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to merge audio and video streams.")
+        logger.error(f"Download error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to process and merge media streams.")
 
-    def file_stream_and_cleanup():
+    def stream_and_clean():
         try:
             with open(real_filepath, "rb") as f:
                 while chunk := f.read(1024 * 1024):
@@ -208,8 +169,8 @@ def download_media(video_url: str = Query(...), format_id: str = Query(...), tit
                 except Exception:
                     pass
 
-    encoded_filename = urllib.parse.quote(f"{safe_title}.{ext}")
+    encoded_name = urllib.parse.quote(f"{safe_title}.{ext}")
     headers = {
-        "Content-Disposition": f"attachment; filename=\"{encoded_filename}\"; filename*=UTF-8''{encoded_filename}"
+        "Content-Disposition": f"attachment; filename=\"{encoded_name}\"; filename*=UTF-8''{encoded_name}"
     }
-    return StreamingResponse(file_stream_and_cleanup(), media_type="application/octet-stream", headers=headers)
+    return StreamingResponse(stream_and_clean(), media_type="application/octet-stream", headers=headers)
