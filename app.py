@@ -27,13 +27,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 class VideoRequest(BaseModel):
     url: HttpUrl
+
 
 COMMON_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Accept-Language': 'en-US,en;q=0.9',
 }
+
 
 def get_opts():
     return {
@@ -44,14 +47,22 @@ def get_opts():
         "http_headers": COMMON_HEADERS,
         "extractor_args": {
             "youtube": {
-                "player_client": ["tvhtml5_simply_embedded", "web_embedded", "android"]
+                # "tv" is currently the most reliable client that works
+                # without a PO Token for most public videos. web_safari
+                # and android are kept as fallbacks if "tv" is rate-limited.
+                "player_client": ["tv", "web_safari", "android"],
+                # Don't silently drop formats that would need a PO Token —
+                # keep them available instead of erroring out entirely.
+                "formats": ["missing_pot"],
             }
-        }
+        },
     }
+
 
 @app.get("/api/health")
 def health_check():
     return {"status": "ok"}
+
 
 @app.post("/api/fetch-info")
 def fetch_video_info(req: VideoRequest):
@@ -64,17 +75,23 @@ def fetch_video_info(req: VideoRequest):
             info = ydl.extract_info(url_str, download=False)
     except Exception as e:
         logger.error(f"Extraction error: {str(e)}")
-        raise HTTPException(status_code=400, detail="Cannot access media. The link may be private or restricted.")
+        # Surface a short reason instead of a fully generic message —
+        # makes it much easier to diagnose the next time something breaks.
+        reason = str(e).split('\n')[0][:180]
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot access media. The link may be private, restricted, or the platform changed its rules. ({reason})"
+        )
 
     formats_list = []
     seen = set()
-
     raw_formats = info.get("formats", [])
     raw_formats.sort(key=lambda x: (x.get("height") or 0), reverse=True)
 
     for f in raw_formats:
         h = f.get("height")
         vcodec = f.get("vcodec", "none")
+
         if vcodec != "none" and h and h >= 360:
             if h not in seen:
                 seen.add(h)
@@ -115,6 +132,7 @@ def fetch_video_info(req: VideoRequest):
         "formats": formats_list,
         "original_url": url_str
     }
+
 
 @app.get("/api/download")
 def download_media(video_url: str = Query(...), format_id: str = Query(...), title: str = Query("video"), type: str = Query("video")):
@@ -173,4 +191,5 @@ def download_media(video_url: str = Query(...), format_id: str = Query(...), tit
     headers = {
         "Content-Disposition": f"attachment; filename=\"{encoded_name}\"; filename*=UTF-8''{encoded_name}"
     }
+
     return StreamingResponse(stream_and_clean(), media_type="application/octet-stream", headers=headers)
