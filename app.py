@@ -37,9 +37,22 @@ COMMON_HEADERS = {
     'Accept-Language': 'en-US,en;q=0.9',
 }
 
+# Render mounts Secret Files at /etc/secrets/<filename> automatically.
+COOKIE_PATH_CANDIDATES = [
+    os.environ.get("YOUTUBE_COOKIES_PATH", ""),
+    "/etc/secrets/cookies.txt",
+]
+
+
+def get_cookie_file():
+    for path in COOKIE_PATH_CANDIDATES:
+        if path and os.path.exists(path):
+            return path
+    return None
+
 
 def get_opts():
-    return {
+    opts = {
         "quiet": True,
         "no_warnings": True,
         "nocheckcertificate": True,
@@ -47,21 +60,25 @@ def get_opts():
         "http_headers": COMMON_HEADERS,
         "extractor_args": {
             "youtube": {
-                # "tv" is currently the most reliable client that works
-                # without a PO Token for most public videos. web_safari
-                # and android are kept as fallbacks if "tv" is rate-limited.
                 "player_client": ["tv", "web_safari", "android"],
-                # Don't silently drop formats that would need a PO Token —
-                # keep them available instead of erroring out entirely.
                 "formats": ["missing_pot"],
             }
         },
     }
 
+    cookie_file = get_cookie_file()
+    if cookie_file:
+        opts["cookiefile"] = cookie_file
+        logger.info(f"Using YouTube cookies from: {cookie_file}")
+    else:
+        logger.warning("No YouTube cookies file found — YouTube requests may be blocked as bot traffic.")
+
+    return opts
+
 
 @app.get("/api/health")
 def health_check():
-    return {"status": "ok"}
+    return {"status": "ok", "youtube_cookies_loaded": get_cookie_file() is not None}
 
 
 @app.post("/api/fetch-info")
@@ -75,8 +92,6 @@ def fetch_video_info(req: VideoRequest):
             info = ydl.extract_info(url_str, download=False)
     except Exception as e:
         logger.error(f"Extraction error: {str(e)}")
-        # Surface a short reason instead of a fully generic message —
-        # makes it much easier to diagnose the next time something breaks.
         reason = str(e).split('\n')[0][:180]
         raise HTTPException(
             status_code=400,
@@ -104,7 +119,6 @@ def fetch_video_info(req: VideoRequest):
                     "filesize": f.get("filesize") or f.get("filesize_approx") or 0
                 })
 
-    # Always ensure 720p or Best exists
     if not formats_list:
         formats_list.append({
             "format_id": "best",
@@ -115,7 +129,6 @@ def fetch_video_info(req: VideoRequest):
             "filesize": 0
         })
 
-    # Audio track
     formats_list.append({
         "format_id": "bestaudio",
         "type": "audio",
