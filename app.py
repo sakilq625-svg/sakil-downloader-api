@@ -37,48 +37,26 @@ COMMON_HEADERS = {
     'Accept-Language': 'en-US,en;q=0.9',
 }
 
-# Render mounts Secret Files at /etc/secrets/<filename> automatically.
-COOKIE_PATH_CANDIDATES = [
-    os.environ.get("YOUTUBE_COOKIES_PATH", ""),
-    "/etc/secrets/cookies.txt",
-]
 
-
-def get_cookie_file():
-    for path in COOKIE_PATH_CANDIDATES:
-        if path and os.path.exists(path):
-            return path
-    return None
-
-
+# Instagram/Facebook only now — no more YouTube-specific extractor_args,
+# player_client juggling, or cookies.txt handling. Keeps this fast and
+# simple since these two platforms don't need any of that.
 def get_opts():
-    opts = {
+    return {
         "quiet": True,
         "no_warnings": True,
         "nocheckcertificate": True,
         "geo_bypass": True,
         "http_headers": COMMON_HEADERS,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["tv", "web_safari", "android"],
-                "formats": ["missing_pot"],
-            }
-        },
+        "noplaylist": True,     # only the single reel/post linked, never a whole profile/carousel
+        "socket_timeout": 15,   # fail fast instead of hanging on a stuck connection
+        "retries": 2,
     }
-
-    cookie_file = get_cookie_file()
-    if cookie_file:
-        opts["cookiefile"] = cookie_file
-        logger.info(f"Using YouTube cookies from: {cookie_file}")
-    else:
-        logger.warning("No YouTube cookies file found — YouTube requests may be blocked as bot traffic.")
-
-    return opts
 
 
 @app.get("/api/health")
 def health_check():
-    return {"status": "ok", "youtube_cookies_loaded": get_cookie_file() is not None}
+    return {"status": "ok"}
 
 
 @app.post("/api/fetch-info")
@@ -95,7 +73,7 @@ def fetch_video_info(req: VideoRequest):
         reason = str(e).split('\n')[0][:180]
         raise HTTPException(
             status_code=400,
-            detail=f"Cannot access media. The link may be private, restricted, or the platform changed its rules. ({reason})"
+            detail=f"Cannot access media. The link may be private, restricted, or invalid. ({reason})"
         )
 
     formats_list = []
