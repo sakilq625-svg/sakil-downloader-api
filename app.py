@@ -1,14 +1,14 @@
-import os
-import logging
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
-import yt_dlp
+import requests
+import re
+import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Fast Social Video Downloader API")
+app = FastAPI(title="Social Downloader API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,92 +21,109 @@ app.add_middleware(
 class VideoRequest(BaseModel):
     url: HttpUrl
 
-COMMON_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Accept-Language': 'en-US,en;q=0.9',
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Mode": "navigate"
 }
 
+def extract_shortcode(url: str):
+    match = re.search(r'/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)', url)
+    return match.group(1) if match else None
+
 @app.get("/api/health")
-def health_check():
+def health():
     return {"status": "ok"}
 
 @app.post("/api/fetch-info")
-def fetch_video_info(req: VideoRequest):
+def fetch_info(req: VideoRequest):
     url_str = str(req.url)
+    
+    # 1. Instagram Direct Embed Parser (Bypasses 429 Data Center Blocking)
+    if "instagram.com" in url_str:
+        shortcode = extract_shortcode(url_str)
+        if not shortcode:
+            raise HTTPException(status_code=400, detail="Invalid Instagram URL format.")
+        
+        embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
+        try:
+            res = requests.get(embed_url, headers=HEADERS, timeout=12)
+            if res.status_code == 200:
+                html = res.text
+                
+                # Extract clean video source
+                video_url_match = re.search(r'\"video_url\":\"([^\"]+)\"', html)
+                if not video_url_match:
+                    video_url_match = re.search(r'<video[^>]+src=\"([^\"]+)\"', html)
+                
+                # Extract clean thumbnail
+                thumb_match = re.search(r'\"display_url\":\"([^\"]+)\"', html)
+                if not thumb_match:
+                    thumb_match = re.search(r'<img[^>]+class=\"EmbeddedMediaImage\"[^>]+src=\"([^\"]+)\"', html)
 
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "nocheckcertificate": True,
-        "http_headers": COMMON_HEADERS,
-        "skip_download": True,
-        "extract_flat": False,
-    }
+                if video_url_match:
+                    clean_video_url = video_url_match.group(1).replace("\\u0026", "&").replace("&amp;", "&")
+                    clean_thumb = thumb_match.group(1).replace("\\u0026", "&").replace("&amp;", "&") if thumb_match else ""
 
-    # cookies.txt ফাইল থাকলে তা স্বয়ংক্রিয়ভাবে ব্যবহার করবে
-    if os.path.exists("cookies.txt"):
-        ydl_opts["cookiefile"] = "cookies.txt"
+                    return {
+                        "title": f"Instagram_Reel_{shortcode}",
+                        "thumbnail": clean_thumb or "https://placehold.co/600x400/241C19/ffffff?text=Instagram+Video",
+                        "duration": 30,
+                        "uploader": "Instagram",
+                        "formats": [
+                            {
+                                "quality": "HD",
+                                "label": "Original HD (MP4)",
+                                "type": "video",
+                                "filesize": 0,
+                                "download_url": clean_video_url
+                            }
+                        ]
+                    }
+        except Exception as e:
+            logger.error(f"Embed extraction failed: {str(e)}")
 
+    # 2. Facebook & Secondary Fallback Processing
     try:
+        import yt_dlp
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "http_headers": HEADERS
+        }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url_str, download=False)
-    except yt_dlp.utils.DownloadError as e:
-        error_msg = str(e)
-        logger.error(f"DownloadError: {error_msg}")
-        if "429" in error_msg:
-            raise HTTPException(
-                status_code=429,
-                detail="Instagram has rate-limited the server IP. Please try again later or configure authenticated cookies."
-            )
+            formats = []
+            for f in info.get("formats", []):
+                if f.get("url") and f.get("vcodec") != "none" and f.get("acodec") != "none":
+                    formats.append({
+                        "quality": f"{f.get('height', 'HD')}p",
+                        "label": f"{f.get('height', 'HD')}p HD (MP4)",
+                        "type": "video",
+                        "filesize": f.get("filesize") or 0,
+                        "download_url": f.get("url")
+                    })
+            if not formats and info.get("url"):
+                formats.append({
+                    "quality": "HD",
+                    "label": "HD (MP4)",
+                    "type": "video",
+                    "filesize": 0,
+                    "download_url": info.get("url")
+                })
+            
+            return {
+                "title": info.get("title", "Social_Video"),
+                "thumbnail": info.get("thumbnail") or "https://placehold.co/600x400/241C19/ffffff?text=Video+Ready",
+                "duration": info.get("duration", 30),
+                "uploader": info.get("uploader", "Social Media"),
+                "formats": formats
+            }
+    except Exception as e:
+        logger.error(f"Fallback error: {str(e)}")
         raise HTTPException(
             status_code=400,
-            detail="Unable to fetch video. The link might be private, deleted, or region-restricted."
+            detail="Unable to access media. The post might be private, restricted, or unavailable."
         )
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error processing video.")
-
-    formats_list = []
-    seen = set()
-    raw_formats = info.get("formats", [])
-    raw_formats.sort(key=lambda x: (x.get("height") or 0), reverse=True)
-
-    for f in raw_formats:
-        direct_url = f.get("url")
-        if not direct_url:
-            continue
-
-        acodec = f.get("acodec", "none")
-        vcodec = f.get("vcodec", "none")
-        h = f.get("height")
-
-        if vcodec != "none" and acodec != "none" and h:
-            quality_tag = f"{h}p"
-            if quality_tag not in seen:
-                seen.add(quality_tag)
-                formats_list.append({
-                    "quality": quality_tag,
-                    "label": f"{quality_tag} HD (MP4)",
-                    "type": "video",
-                    "filesize": f.get("filesize") or f.get("filesize_approx") or 0,
-                    "download_url": direct_url
-                })
-
-    if not formats_list:
-        fallback_url = info.get("url")
-        if fallback_url:
-            formats_list.append({
-                "quality": "HD",
-                "label": "HD Quality (MP4)",
-                "type": "video",
-                "filesize": info.get("filesize") or 0,
-                "download_url": fallback_url
-            })
-
-    return {
-        "title": info.get("title", "Social_Video"),
-        "thumbnail": info.get("thumbnail") or "https://placehold.co/600x400/241C19/ffffff?text=Video+Ready",
-        "duration": info.get("duration", 30),
-        "uploader": info.get("uploader") or "Instagram / Facebook",
-        "formats": formats_list
-    }
